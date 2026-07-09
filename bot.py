@@ -73,6 +73,148 @@ channel_creates  = defaultdict(list)           # user_id -> [(timestamp, channel
 recent_joins     = []                          # [(user_id, timestamp)]
 raid_mode        = False
 last_nsfw_msg_id = None
+invites_cache    = {}                          # guild_id -> {code: invite}
+
+# ─── stats database ──────────────────────────────────────────
+import sqlite3
+
+def init_db():
+    conn = sqlite3.connect("stats.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS invites (
+            guild_id INTEGER,
+            user_id INTEGER,
+            inviter_id INTEGER,
+            invite_code TEXT,
+            timestamp TEXT,
+            PRIMARY KEY (guild_id, user_id)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS leaves (
+            guild_id INTEGER,
+            user_id INTEGER,
+            timestamp TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def record_join(guild_id, user_id, inviter_id, invite_code):
+    try:
+        conn = sqlite3.connect("stats.db")
+        cursor = conn.cursor()
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        cursor.execute(
+            "INSERT OR REPLACE INTO invites (guild_id, user_id, inviter_id, invite_code, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (guild_id, user_id, inviter_id, invite_code, now)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"record_join db error: {e}")
+
+def record_leave(guild_id, user_id):
+    try:
+        conn = sqlite3.connect("stats.db")
+        cursor = conn.cursor()
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        cursor.execute(
+            "INSERT INTO leaves (guild_id, user_id, timestamp) VALUES (?, ?, ?)",
+            (guild_id, user_id, now)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"record_leave db error: {e}")
+
+def get_stats(guild_id):
+    try:
+        conn = sqlite3.connect("stats.db")
+        cursor = conn.cursor()
+        
+        # Start of today (UTC)
+        today_start = datetime.datetime.now(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        
+        # Joins today
+        cursor.execute("SELECT COUNT(*) FROM invites WHERE guild_id = ? AND timestamp >= ?", (guild_id, today_start))
+        joins_today = cursor.fetchone()[0]
+        
+        # Leaves today
+        cursor.execute("SELECT COUNT(*) FROM leaves WHERE guild_id = ? AND timestamp >= ?", (guild_id, today_start))
+        leaves_today = cursor.fetchone()[0]
+        
+        # Total invites overall
+        cursor.execute("""
+            SELECT inviter_id, COUNT(*) as count 
+            FROM invites 
+            WHERE guild_id = ? AND inviter_id IS NOT NULL 
+            GROUP BY inviter_id 
+            ORDER BY count DESC 
+            LIMIT 10
+        """, (guild_id,))
+        leaderboard_overall = cursor.fetchall()
+        
+        # Total invites today
+        cursor.execute("""
+            SELECT inviter_id, COUNT(*) as count 
+            FROM invites 
+            WHERE guild_id = ? AND inviter_id IS NOT NULL AND timestamp >= ? 
+            GROUP BY inviter_id 
+            ORDER BY count DESC 
+            LIMIT 10
+        """, (guild_id, today_start))
+        leaderboard_today = cursor.fetchall()
+        
+        conn.close()
+        return joins_today, leaves_today, leaderboard_overall, leaderboard_today
+    except Exception as e:
+        print(f"get_stats db error: {e}")
+        return 0, 0, [], []
+
+def get_user_invite_count(guild_id, user_id):
+    try:
+        conn = sqlite3.connect("stats.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM invites WHERE guild_id = ? AND inviter_id = ?", (guild_id, user_id))
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+    except Exception:
+        return 0
+
+async def update_invites_cache(guild: discord.Guild):
+    try:
+        invites = await guild.invites()
+        invites_cache[guild.id] = {invite.code: invite for invite in invites}
+    except Exception:
+        pass
+
+async def find_inviter(member: discord.Member):
+    guild = member.guild
+    cached = invites_cache.get(guild.id, {})
+    try:
+        current_invites = await guild.invites()
+    except Exception:
+        return None, None
+        
+    used_invite = None
+    for invite in current_invites:
+        old_invite = cached.get(invite.code)
+        if old_invite and invite.uses > old_invite.uses:
+            used_invite = invite
+            break
+            
+    # Update cache
+    invites_cache[guild.id] = {invite.code: invite for invite in current_invites}
+    
+    if used_invite:
+        return used_invite.inviter, used_invite.code
+    return None, None
+
 
 
 # ═════════════════════════════════════════════════════════════
@@ -903,6 +1045,43 @@ async def bot_info(ctx):
     
     await ctx.send(embed=embed)
 
+@bot.command(name="leaderboard", aliases=["stats", "invites"])
+async def leaderboard_command(ctx):
+    """displays invite leaderboard and join/leave stats. format: s!leaderboard"""
+    guild = ctx.guild
+    if not guild:
+        return
+        
+    joins_today, leaves_today, lb_overall, lb_today = get_stats(guild.id)
+    
+    # Format today's leaderboard
+    today_lb_str = ""
+    if lb_today:
+        for idx, (inviter_id, count) in enumerate(lb_today, 1):
+            today_lb_str += f"{idx}. <@{inviter_id}> - **{count}** joins\n"
+    else:
+        today_lb_str = "*No invites today.*"
+        
+    # Format overall leaderboard
+    overall_lb_str = ""
+    if lb_overall:
+        for idx, (inviter_id, count) in enumerate(lb_overall, 1):
+            overall_lb_str += f"{idx}. <@{inviter_id}> - **{count}** joins\n"
+    else:
+        overall_lb_str = "*No invites recorded.*"
+        
+    embed = discord.Embed(
+        title="Server Statistics & Invite Leaderboard",
+        color=EMBED_COLOR
+    )
+    embed.add_field(name="📈 Daily Stats", value=f"**Joins Today:** {joins_today}\n**Leaves Today:** {leaves_today}", inline=False)
+    embed.add_field(name="🏆 Today's Top Inviters", value=today_lb_str, inline=True)
+    embed.add_field(name="👑 Overall Top Inviters", value=overall_lb_str, inline=True)
+    embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
+    
+    await ctx.send(embed=embed)
+
+
 @bot.command(name="help")
 async def custom_help(ctx):
     """displays the bot command list. format: s!help"""
@@ -932,6 +1111,7 @@ async def custom_help(ctx):
     )
     
     utility_text = (
+        "`s!leaderboard` - invite leaderboard & daily stats (alias: `s!stats`, `s!invites`)\n"
         "`s!ping` - shows bot response delay\n"
         "`s!avatar [@user]` - displays avatar of a member (alias: `s!av`)\n"
         "`s!userinfo [@user]` - displays detailed user profile (alias: `s!whois`, `s!ui`)\n"
@@ -962,6 +1142,12 @@ async def on_ready():
         )
     except Exception as e:
         print(f"failed to set status: {e}")
+
+    # cache invites
+    print("Caching invites...")
+    for guild in bot.guilds:
+        await update_invites_cache(guild)
+    print("Invites cached.")
 
     # register persistent views
     bot.add_view(TicketDropdownView())
@@ -1279,19 +1465,32 @@ async def on_member_join(member: discord.Member):
     guild = member.guild
     now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
 
+    # Track inviter
+    inviter, invite_code = await find_inviter(member)
+    inviter_id = inviter.id if inviter else None
+    record_join(guild.id, member.id, inviter_id, invite_code)
+
+    # Get stats for today
+    joins_today, leaves_today, _, _ = get_stats(guild.id)
+    inviter_count = get_user_invite_count(guild.id, inviter_id) if inviter_id else 0
+
     # ── detailed join log ──
     account_age = datetime.datetime.now(datetime.timezone.utc) - member.created_at
     is_new_account = account_age.days < 7
+
+    invite_info = f"**invited by:** {inviter.mention} (code: `{invite_code}` | **{inviter_count}** invites)\n" if inviter else "**invited by:** unknown/vanity url\n"
 
     log_embed = discord.Embed(
         title="member joined",
         description=(
             f"**user:** {member} ({member.mention})\n"
             f"**user id:** `{member.id}`\n"
+            f"{invite_info}"
             f"**account created:** {ts(member.created_at)} ({ts_relative(member.created_at)})\n"
             f"**account age:** {account_age.days} days\n"
             f"**is bot:** {'yes' if member.bot else 'no'}\n"
             f"**member count:** {guild.member_count}\n"
+            f"**joins today:** {joins_today} | **leaves today:** {leaves_today}\n"
             f"**timestamp:** {ts()}"
         ),
         color=EMBED_COLOR
@@ -1368,6 +1567,12 @@ async def on_member_remove(member: discord.Member):
     roles = ", ".join(r.mention for r in member.roles[1:]) or "none"
     join_date = member.joined_at
 
+    # Record leave in DB
+    record_leave(guild.id, member.id)
+
+    # Get stats for today
+    joins_today, leaves_today, _, _ = get_stats(guild.id)
+
     # check if it was a kick or ban via audit log
     action_info = ""
     try:
@@ -1399,6 +1604,7 @@ async def on_member_remove(member: discord.Member):
             f"{duration}"
             f"{action_info}\n"
             f"**member count:** {guild.member_count}\n"
+            f"**joins today:** {joins_today} | **leaves today:** {leaves_today}\n"
             f"**timestamp:** {ts()}"
         ),
         color=EMBED_COLOR
