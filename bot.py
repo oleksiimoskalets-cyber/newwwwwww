@@ -46,12 +46,12 @@ TOKEN = os.getenv("BOT_TOKEN")
 TICKET_CHANNEL_ID   = 1524735248233922621
 TICKET_CATEGORY_ID  = 1524720688827727994
 LOG_CHANNEL_ID      = 1524751486834184192
-PING_ROLES          = [1521769888249810985, 1524736000356651108]
+PING_ROLES          = [1521769888249810985, 1524736000356651108, 1524785164025069739]
 EMBED_COLOR         = 0x000000
 TICKET_IMAGE        = "https://i.pinimg.com/736x/04/c2/68/04c2681b9e885b1502e3c301c98061b3.jpg"
 
 # anti-spam
-SPAM_MSG_LIMIT      = 5
+SPAM_MSG_LIMIT      = 10
 SPAM_TIME_WINDOW    = 5       # seconds
 SPAM_TIMEOUT        = 300     # seconds (5 min)
 
@@ -1063,22 +1063,7 @@ async def on_message(message: discord.Message):
     member = message.author
     is_admin = member.guild_permissions.administrator
 
-    # ── claimed ticket: block other staff ──
-    ticket = active_tickets.get(message.channel.id)
-    if ticket and ticket["claimed_by"]:
-        if message.author.id != ticket["owner"] and message.author.id != ticket["claimed_by"]:
-            is_staff = any(message.author.get_role(r) for r in PING_ROLES)
-            if is_staff:
-                try:
-                    await message.delete()
-                    warn = await message.channel.send(
-                        f"{message.author.mention}, <@{ticket['claimed_by']}> is already operating this ticket."
-                    )
-                    await asyncio.sleep(5)
-                    await warn.delete()
-                except Exception:
-                    pass
-                return
+
 
     # ── anti discord invite link ──
     if not is_admin:
