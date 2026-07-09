@@ -11,9 +11,34 @@ from collections import defaultdict
 import discord
 from discord.ext import commands
 from discord import ui, app_commands
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ─── background web server for Render health checks ──────────
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+    
+    def log_message(self, format, *args):
+        return
+
+def run_web_server():
+    port = int(os.getenv("PORT", 8080))
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        print(f"Health check web server started on port {port}")
+        server.serve_forever()
+    except Exception as e:
+        print(f"Failed to start health check server: {e}")
+
+# Start the health check server in a background thread
+threading.Thread(target=run_web_server, daemon=True).start()
 
 # ─── configuration ───────────────────────────────────────────
 TOKEN = os.getenv("BOT_TOKEN")
